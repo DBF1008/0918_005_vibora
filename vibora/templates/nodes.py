@@ -9,6 +9,8 @@ class Node:
     def __init__(self, raw: str=''):
         self.children = []
         self.raw = raw
+        # Line number (1-based) of this node in the original template source.
+        self.line_number = 0
 
     @staticmethod
     def check(node: str, is_tag: bool):
@@ -16,7 +18,7 @@ class Node:
 
     def compile(self, compiler, recursive: bool=True):
         if self.raw:
-            compiler.add_comment(self.raw)
+            compiler.add_comment(self.raw, line_number=self.line_number)
         if recursive:
             for child in self.children:
                 child.compile(compiler)

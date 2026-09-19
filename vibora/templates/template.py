@@ -13,6 +13,9 @@ class Template:
     def __init__(self, content: str):
         self.content = content
         self.hash = hashlib.md5(content.encode()).hexdigest()
+        # Original file path of this template, when loaded from disk.
+        # Used by compilers to inject source mapping information.
+        self.filename = None
 
 
 class ParsedTemplate(Template):
@@ -123,17 +126,24 @@ class TemplateParser:
         :return:
         """
         parsed_template = ParsedTemplate(content=template.content, ast=Node())
+        parsed_template.filename = getattr(template, 'filename', None)
         current_nodes, stop_tokens = [parsed_template.ast], []
         content = template.content
         while content:
+            offset = len(template.content) - len(content)
+            line_number = template.content.count('\n', 0, offset) + 1
             next_node = self.find_next_node(content)
             if not next_node:
-                current_nodes[-1].children.append(TextNode(content))
+                text_node = TextNode(content)
+                text_node.line_number = line_number
+                current_nodes[-1].children.append(text_node)
                 break
             else:
                 previous_text = content[:next_node[0].span()[0]]
                 if previous_text:
-                    current_nodes[-1].children.append(TextNode(previous_text))
+                    text_node = TextNode(previous_text)
+                    text_node.line_number = line_number
+                    current_nodes[-1].children.append(text_node)
             if stop_tokens and self.token_is_equal(next_node[0].group().strip(), stop_tokens[-1]):
                 current_nodes = current_nodes[:-1]
                 stop_tokens = stop_tokens[:-1]
@@ -143,6 +153,8 @@ class TemplateParser:
                 found_node, stop_tag = self.parse_node(next_node[0].group(), next_node[1])
                 if not found_node:
                     raise InvalidTag(next_node)
+                found_node.line_number = template.content.count(
+                    '\n', 0, offset + next_node[0].span()[0]) + 1
                 if stop_tag:
                     # Greed case
                     current_nodes[-1].children.append(found_node)

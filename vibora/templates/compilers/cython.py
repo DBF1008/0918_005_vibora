@@ -4,9 +4,9 @@ import os
 import tempfile
 import time
 import datetime
-from setuptools import Extension, setup
 from ..compilers.base import TemplateCompiler
-from ..utils import find_template_binary, CompilerFlavor, TemplateMeta, get_architecture_signature, CompilationResult
+from ..utils import find_template_binary, CompilerFlavor, TemplateMeta, get_architecture_signature, \
+    CompilationResult, SourceMap
 
 
 # TODO: Remove 'render' hardcoded name.
@@ -28,6 +28,8 @@ class CythonTemplateCompiler(TemplateCompiler):
         self.functions = []
         self.flavor = flavor
         self.temporary_dir = temporary_dir or tempfile.gettempdir()
+        self.pending_comment = None
+        self.source_map = SourceMap()
 
     def clean(self):
         self._indentation = 0
@@ -36,6 +38,8 @@ class CythonTemplateCompiler(TemplateCompiler):
         self.accumulated_text = ''
         self.functions = []
         self.flavor = CompilerFlavor.TEMPLATE
+        self.pending_comment = None
+        self.source_map = SourceMap()
 
     def add_text(self, content: str):
         content = content.replace("\n", "\\n")
@@ -48,13 +52,45 @@ class CythonTemplateCompiler(TemplateCompiler):
         stm = f'{self.content_var}.append("{text}")'
         self.add_statement(stm)
 
+    def add_eval(self, statement: str):
+        self.add_statement(f'{self.content_var}.append({statement})')
+
+    def add_comment(self, content: str, line_number: int=None):
+        """
+        Injects source mapping information into the generated code: the raw
+        template source is emitted as a comment and the generated line is
+        recorded in the source map together with the original template line.
+
+        :param content:
+        :param line_number: line number in the original template source.
+        :return:
+        """
+        comment = (' ' * self._indentation) + '# ' + content.strip() + '\n'
+        self.pending_comment = (comment, line_number, content.strip())
+
+    def flush_comment(self):
+        if self.pending_comment:
+            comment, template_line, raw_source = self.pending_comment
+            self.content += comment
+            # The next generated statement belongs to the flushed comment.
+            generated_line = self.content.count('\n') + 1
+            self.source_map.add(generated_line, template_line, raw_source)
+            self.pending_comment = None
+
     def add_statement(self, content: str):
+        self.flush_comment()
         if self.accumulated_text:
             self.flush_text()
         new_content = (' ' * self._indentation) + content.strip() + '\n'
         self.content += new_content
 
     def consume(self, template):
+        # Source mapping header so the generated file always points back
+        # to the original template it was generated from.
+        filename = getattr(template, 'filename', None)
+        self.source_map.filename = filename
+        self.content += f'# template: {filename or "<unknown>"}\n'
+        self.content += f'# template_hash: {template.hash}\n'
         self.add_statement(f'cpdef str render(dict {self.context_var}):')
         self._indentation += 4
         self.add_statement(f"cdef list {self.content_var} = []")
@@ -86,6 +122,10 @@ class CythonTemplateCompiler(TemplateCompiler):
         :param template:
         :return:
         """
+        # Imported lazily so source generation/mapping features remain
+        # usable even when the build toolchain is not installed.
+        from setuptools import Extension, setup
+
         # Tracking compile times
         started_at = time.time()
 
@@ -134,7 +174,8 @@ class CythonTemplateCompiler(TemplateCompiler):
         # Compilation result contains the meta data and the render function loaded at runtime.
         compilation = CompilationResult(
             template=template,
-            meta=meta, render_function=compiled_template.render, code=open(compiled_path, 'rb').read()
+            meta=meta, render_function=compiled_template.render, code=open(compiled_path, 'rb').read(),
+            source_map=self.source_map
         )
 
         # Clearing state

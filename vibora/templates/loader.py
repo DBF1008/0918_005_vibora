@@ -19,6 +19,7 @@ class TemplateLoader(threading.Thread):
         self.has_to_run = True
 
     def reload_templates(self, paths: list):
+        changed_templates = {}
         for root, path in paths:
             if path in self.path_index:
                 template = self.path_index[path]
@@ -34,14 +35,19 @@ class TemplateLoader(threading.Thread):
                     if template_hash in self.hash_index:
                         values = self.hash_index[template_hash]
                         self.engine.remove_template(values[2])
-                        self.add_to_engine(values[0], values[1])
+                        changed = self.add_to_engine(values[0], values[1])
+                        changed_templates[changed.hash] = changed
 
                 # Removing the actual template.
                 self.engine.remove_template(template)
 
-            self.add_to_engine(root, path)
+            changed = self.add_to_engine(root, path)
+            changed_templates[changed.hash] = changed
         self.engine.sync_cache()
-        self.engine.compile_templates()
+        # Incremental compilation: only recompile the templates that actually
+        # changed (and their dependents) instead of the entire template set,
+        # which keeps CPU usage flat on big projects.
+        self.engine.compile_many(changed_templates.values())
 
     def check_for_modified_templates(self):
         to_be_notified = []
@@ -65,10 +71,12 @@ class TemplateLoader(threading.Thread):
     def add_to_engine(self, root: str, path: str):
         with open(path, 'r') as f:
             template = Template(f.read())
+            template.filename = path
             names = get_import_names(root, path)
             template = self.engine.add_template(template, names=names)
             self.path_index[path] = template
             self.hash_index[template.hash] = (root, path, template)
+            return template
 
     def load(self):
         for directory in self.directories:
@@ -77,6 +85,12 @@ class TemplateLoader(threading.Thread):
                     if file.endswith(self.supported_files):
                         path = os.path.join(root, file)
                         self.add_to_engine(root, path)
+                        try:
+                            # Seeding the modification cache so the first polling
+                            # cycle does not mistake every file for a new one.
+                            self.cache[path] = os.path.getmtime(path)
+                        except FileNotFoundError:
+                            continue
 
     def run(self):
         while self.has_to_run:

@@ -90,10 +90,13 @@ class PythonTemplateCompiler(TemplateCompiler):
         """
         self.add_statement(f'yield {statement}')
 
-    def add_comment(self, content: str):
+    def add_comment(self, content: str, line_number: int=None):
         """
 
         :param content:
+        :param line_number: line number in the original template source
+               (kept for interface compatibility, the pure Python compiler
+               maps exceptions through the raw comments themselves).
         :return:
         """
         comment = (' ' * self._indentation) + '# ' + content.strip() + '\n'

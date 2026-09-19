@@ -61,16 +61,39 @@ class TemplateEngine:
         :param names:
         :return:
         """
-        template = self.template_parser.parse(template)
-        missing_names = 0
-        for name in names:
-            if name not in self.templates:
-                self.templates[name] = template
-            else:
-                missing_names += 1
-                if missing_names == len(names):
-                    raise ConflictingNames('This template needs a unique name because imports are name based.')
-        return template
+        return self.add_templates([(template, names)])[0]
+
+    def add_templates(self, templates: list) -> list:
+        """
+        Transactionally registers a batch of templates: either every template
+        is registered or none of them are (all-or-nothing semantics).
+
+        Each item must be a (Template, names) tuple. If any template fails to
+        parse or has no unique name available, the whole batch is rolled back
+        and the engine state is left untouched.
+
+        :param templates: list of (Template, names) tuples.
+        :return: list of ParsedTemplate, in the same order as the input.
+        """
+        parsed_templates = []
+        staged = {}
+        reserved_names = set(self.templates)
+        for template, names in templates:
+            # Parsing happens before any state mutation so a parse
+            # failure cannot leave partial side effects behind.
+            parsed = self.template_parser.parse(template)
+            available_names = [name for name in names if name not in reserved_names]
+            if not available_names:
+                raise ConflictingNames('This template needs a unique name because imports are name based.')
+            for name in available_names:
+                staged[name] = parsed
+            reserved_names.update(available_names)
+            parsed_templates.append(parsed)
+
+        # Commit point: the batch was fully validated upfront so the
+        # registration below cannot fail halfway through.
+        self.templates.update(staged)
+        return parsed_templates
 
     async def render(self, name: str, streaming: bool=False, **template_vars):
         """
@@ -170,23 +193,42 @@ class TemplateEngine:
         :param verbose:
         :return:
         """
-        # Checking if all dependencies are met
-        for template in self.templates.values():
-
-            # Trying to load the compiled version from cache,
-            # if not possible then let's call the compiler to build this template.
-            compiled_template = self.cache.get(template.hash)
-            if compiled_template is None:
-
-                # Optimizing/Replacing nodes so we compile it with the final AST.
-                if not template.prepared:
-                    self.prepare_template(template)
-
-                compiled_template = self.compiler.compile(template, verbose=verbose)
-                self.cache.store(compiled_template)
-
-            # Caching the render function for fast access.
-            self.compiled_templates[template.hash] = compiled_template
+        self.compile_many(self.templates.values(), verbose=verbose)
 
         # Cleaning old template cache files.
         self.cache.clean(set([t.hash for t in self.templates.values()]))
+
+    def compile_many(self, templates, verbose=False):
+        """
+        Compiles only the given templates instead of the entire engine,
+        allowing incremental recompilation of what actually changed.
+
+        :param templates:
+        :param verbose:
+        :return:
+        """
+        for template in templates:
+            self.compile_template(template, verbose=verbose)
+
+    def compile_template(self, template: ParsedTemplate, verbose=False) -> CompiledTemplate:
+        """
+
+        :param template:
+        :param verbose:
+        :return:
+        """
+        # Trying to load the compiled version from cache,
+        # if not possible then let's call the compiler to build this template.
+        compiled_template = self.cache.get(template.hash)
+        if compiled_template is None:
+
+            # Optimizing/Replacing nodes so we compile it with the final AST.
+            if not template.prepared:
+                self.prepare_template(template)
+
+            compiled_template = self.compiler.compile(template, verbose=verbose)
+            self.cache.store(compiled_template)
+
+        # Caching the render function for fast access.
+        self.compiled_templates[template.hash] = compiled_template
+        return compiled_template

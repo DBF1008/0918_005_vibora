@@ -35,6 +35,9 @@ class TemplateCompiler:
     def add_statement(self, content: str):
         raise NotImplementedError
 
+    def add_comment(self, content: str, line_number: int=None):
+        raise NotImplementedError
+
     def consume(self, template):
         raise NotImplementedError
 
