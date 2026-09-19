@@ -10,15 +10,17 @@ from .nodes import EvalNode, ForNode, ExtendsNode, BlockNode, IfNode, ElifNode, 
 
 class Template:
 
-    def __init__(self, content: str):
+    def __init__(self, content: str, source: str=None):
         self.content = content
+        self.source = source or '<template>'
         self.hash = hashlib.md5(content.encode()).hexdigest()
 
 
 class ParsedTemplate(Template):
 
-    def __init__(self, content: str, ast: Node, dependencies: set = None, prepared: bool = False):
-        super().__init__(content=content)
+    def __init__(self, content: str, ast: Node, dependencies: set = None, prepared: bool = False,
+                 source: str = None):
+        super().__init__(content=content, source=source)
         self.ast = ast
         self.dependencies = dependencies or set()
         self.prepared = prepared
@@ -122,27 +124,34 @@ class TemplateParser:
         :param template:
         :return:
         """
-        parsed_template = ParsedTemplate(content=template.content, ast=Node())
+        parsed_template = ParsedTemplate(content=template.content, ast=Node(),
+                                         source=template.source)
         current_nodes, stop_tokens = [parsed_template.ast], []
         content = template.content
+        consumed = 0
         while content:
             next_node = self.find_next_node(content)
             if not next_node:
                 current_nodes[-1].children.append(TextNode(content))
                 break
             else:
-                previous_text = content[:next_node[0].span()[0]]
+                node_start, node_end = next_node[0].span()
+                previous_text = content[:node_start]
                 if previous_text:
                     current_nodes[-1].children.append(TextNode(previous_text))
-            if stop_tokens and self.token_is_equal(next_node[0].group().strip(), stop_tokens[-1]):
+                raw_tag = content[node_start:node_end]
+            if stop_tokens and self.token_is_equal(raw_tag.strip(), stop_tokens[-1]):
                 current_nodes = current_nodes[:-1]
                 stop_tokens = stop_tokens[:-1]
-                content = content[next_node[0].span()[1]:]
+                consumed += node_end
+                content = content[node_end:]
                 continue
             if next_node:
                 found_node, stop_tag = self.parse_node(next_node[0].group(), next_node[1])
                 if not found_node:
                     raise InvalidTag(next_node)
+                found_node.line = template.content.count('\n', 0, consumed + node_start) + 1
+                found_node.source = template.source
                 if stop_tag:
                     # Greed case
                     current_nodes[-1].children.append(found_node)
@@ -150,5 +159,6 @@ class TemplateParser:
                     stop_tokens.append(stop_tag)
                 else:
                     current_nodes[-1].children.append(found_node)
-                content = content[next_node[0].span()[1]:]
+                consumed += node_end
+                content = content[node_end:]
         return parsed_template

@@ -31,7 +31,7 @@ class TemplateCache:
         while True:
             initial_count = len(death_queue)
             # Detecting updated parents, so their children must be updated.
-            for meta in self.loaded_metas.values():
+            for meta in list(self.loaded_metas.values()):
                 for template_hash in meta.dependencies:
                     if template_hash not in useful_hashes:
                         death_queue.add(meta.template_hash)

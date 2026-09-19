@@ -9,12 +9,16 @@ class Node:
     def __init__(self, raw: str=''):
         self.children = []
         self.raw = raw
+        self.line = 0
+        self.source = None
 
     @staticmethod
     def check(node: str, is_tag: bool):
         return None
 
     def compile(self, compiler, recursive: bool=True):
+        if hasattr(compiler, 'on_node'):
+            compiler.on_node(self)
         if self.raw:
             compiler.add_comment(self.raw)
         if recursive:
@@ -60,6 +64,8 @@ class ForNode(Node):
         stm = prepare_expression(self.target, compiler.context_var, compiler.current_scope)
         optimized_stm = self.optimize_stm(stm)
         if optimized_stm:
+            compiler.add_statement(f'for {var_name} in {stm}:')
+        elif not getattr(compiler, 'supports_async_iteration', True):
             compiler.add_statement(f'for {var_name} in {stm}:')
         else:
             compiler.add_statement(f'async for {var_name} in {smart_iter.__name__}({stm}):')
@@ -172,15 +178,18 @@ class EvalNode(Node):
 
     def _compile_template(self, compiler):
         stm = prepare_expression(self.code, compiler.context_var, compiler.current_scope)
-        compiler.add_statement(f'__temp__ = {stm}')
-        compiler.add_statement(f'if iscoroutine(__temp__):')
-        compiler.indent()
-        compiler.add_eval(f'str(await __temp__)')
-        compiler.rollback()
-        compiler.add_statement(f'else:')
-        compiler.indent()
-        compiler.add_eval(f'str({stm})')
-        compiler.rollback()
+        if getattr(compiler, 'supports_async_values', True):
+            compiler.add_statement(f'__temp__ = {stm}')
+            compiler.add_statement(f'if iscoroutine(__temp__):')
+            compiler.indent()
+            compiler.add_eval(f'str(await __temp__)')
+            compiler.rollback()
+            compiler.add_statement(f'else:')
+            compiler.indent()
+            compiler.add_eval(f'str({stm})')
+            compiler.rollback()
+        else:
+            compiler.add_eval(f'str({stm})')
 
     def compile(self, compiler, recursive: bool=True):
         super().compile(compiler, recursive=False)

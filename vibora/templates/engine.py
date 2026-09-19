@@ -1,3 +1,5 @@
+import copy
+from contextlib import contextmanager
 from typing import Dict
 from .ast import merge, raise_nodes, resolve_include_nodes
 from .exceptions import TemplateNotFound, ConflictingNames
@@ -56,21 +58,80 @@ class TemplateEngine:
 
     def add_template(self, template: Template, names: list) -> ParsedTemplate:
         """
+        Registers a single parsed template under one or more names.
 
-        :param template:
-        :param names:
-        :return:
+        Registration is atomic: if any of the requested names is already
+        taken by another template no state is mutated and ConflictingNames
+        is raised, so the caller never observes a partial registration.
         """
-        template = self.template_parser.parse(template)
-        missing_names = 0
+        parsed_template = self.template_parser.parse(template)
+        conflicts = [name for name in names if name in self.templates]
+        if conflicts:
+            raise ConflictingNames(
+                'This template needs a unique name because imports are name based. '
+                f'Conflicting names: {conflicts}'
+            )
         for name in names:
-            if name not in self.templates:
-                self.templates[name] = template
-            else:
-                missing_names += 1
-                if missing_names == len(names):
-                    raise ConflictingNames('This template needs a unique name because imports are name based.')
-        return template
+            self.templates[name] = parsed_template
+        return parsed_template
+
+    def add_templates(self, templates: list):
+        """
+        Transactionally registers a batch of (Template, names) pairs.
+
+        Every template is parsed and validated up-front and the batch is
+        committed only when no name conflicts exist; any failure rolls the
+        engine back to its previous state (all-or-nothing semantics).
+        """
+        with self.transaction():
+            parsed_templates = []
+            claimed = {}
+            for template, names in templates:
+                parsed_template = self.template_parser.parse(template)
+                for name in names:
+                    if name in self.templates or name in claimed:
+                        raise ConflictingNames(
+                            'This template needs a unique name because imports are name based. '
+                            f'Conflicting name: {name}'
+                        )
+                    claimed[name] = parsed_template
+                parsed_templates.append((parsed_template, names))
+            for parsed_template, names in parsed_templates:
+                for name in names:
+                    self.templates[name] = parsed_template
+            return [parsed_template for parsed_template, _ in parsed_templates]
+
+    def _snapshot(self) -> dict:
+        return {
+            'templates': {
+                name: copy.deepcopy(template) for name, template in self.templates.items()
+            },
+            'compiled_templates': dict(self.compiled_templates),
+            'cache_templates': dict(getattr(self.cache, 'loaded_templates', {})),
+            'cache_metas': dict(getattr(self.cache, 'loaded_metas', {}))
+        }
+
+    def _restore(self, snapshot: dict):
+        self.templates = copy.deepcopy(snapshot['templates'])
+        self.compiled_templates = dict(snapshot['compiled_templates'])
+        cache_templates = getattr(self.cache, 'loaded_templates', None)
+        if cache_templates is not None:
+            self.cache.loaded_templates = dict(snapshot['cache_templates'])
+            self.cache.loaded_metas = dict(snapshot['cache_metas'])
+
+    @contextmanager
+    def transaction(self):
+        """
+        Context manager providing all-or-nothing semantics around batch
+        operations. Any exception raised inside the block rolls back every
+        side effect (registrations, AST rewrites, dependencies, cache).
+        """
+        snapshot = self._snapshot()
+        try:
+            yield self
+        except Exception:
+            self._restore(snapshot)
+            raise
 
     async def render(self, name: str, streaming: bool=False, **template_vars):
         """
@@ -160,9 +221,47 @@ class TemplateEngine:
         :return:
         """
         updated_hashes = [t.hash for t in self.templates.values()]
-        for template_hash, meta in self.cache.loaded_metas.items():
+        for template_hash, meta in list(self.cache.loaded_metas.items()):
             if any([x for x in meta.dependencies if x not in updated_hashes]):
                 self.cache.remove(template_hash)
+
+    def get_dependents(self, template_hashes) -> set:
+        """
+        Returns the transitive closure of templates that depend (directly or
+        indirectly) on any of the given template hashes.
+        """
+        affected = set(template_hashes)
+        changed = True
+        while changed:
+            changed = False
+            for template in self.templates.values():
+                if template.hash in affected:
+                    continue
+                if template.dependencies & affected:
+                    affected.add(template.hash)
+                    changed = True
+        return affected
+
+    def compile_affected(self, changed_hashes: set, verbose: bool = False):
+        """
+        Recompiles only the changed templates and their dependents instead of
+        recompiling the whole project. Still wrapped in a transaction so a
+        failing compile never leaves the engine half-rebuilt.
+        """
+        affected_hashes = self.get_dependents(changed_hashes)
+        with self.transaction():
+            for template in list(self.templates.values()):
+                if template.hash not in affected_hashes:
+                    continue
+                compiled_template = self.cache.get(template.hash)
+                if compiled_template is None:
+                    if not template.prepared:
+                        self.prepare_template(template)
+                    compiled_template = self.compiler.compile(template, verbose=verbose)
+                    self.cache.store(compiled_template)
+                self.compiled_templates[template.hash] = compiled_template
+            self.cache.clean(set(t.hash for t in self.templates.values()))
+        return affected_hashes
 
     def compile_templates(self, verbose=False):
         """
